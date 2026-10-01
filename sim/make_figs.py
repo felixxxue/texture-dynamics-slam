@@ -1,7 +1,35 @@
-"""Figures for the paper (run in a kernel where figure-style helpers are loaded, after analyze.main()).
-exec(open('sim/make_figs.py').read()) with variables: runs, seq, main_t, dl, pc (from analyze.main()).
-Outputs: figs/fig2_frames.pdf/.png, figs/fig3_heatmaps.pdf/.png, figs/fig4_mechanism.pdf/.png
+"""Figures for the paper.
+
+Standalone:  python sim/make_figs.py   (run from the repository root)
+It calls sim/analyze.py:main() for the data, unpacks the example frames
+from data/run_logs.zip if needed, and writes figs/fig2_frames.pdf/.png,
+figs/fig3_heatmaps.pdf/.png and figs/fig4_mechanism.pdf/.png.
 """
+import os, sys, zipfile
+if 'runs' not in globals():
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import analyze
+    runs, seq, main_t, dl, pc, _out = analyze.main()
+if not os.path.isdir('figs/frames') and os.path.exists('data/run_logs.zip'):
+    with zipfile.ZipFile('data/run_logs.zip') as _z:
+        _z.extractall('.', [n for n in _z.namelist() if n.startswith('figs/frames/')])
+if 'apply_figure_style' not in globals():
+    def apply_figure_style(sizes=(8, 7, 6)):
+        """Plain-matplotlib equivalent of the style used for the paper figures."""
+        import matplotlib as _mpl
+        big, mid, small = sizes
+        _mpl.rcParams.update({
+            'font.family': 'sans-serif', 'font.size': mid, 'axes.titlesize': big,
+            'axes.labelsize': mid, 'xtick.labelsize': small, 'ytick.labelsize': small,
+            'legend.fontsize': small, 'axes.spines.top': False, 'axes.spines.right': False,
+            'axes.linewidth': 0.6, 'lines.linewidth': 1.2, 'savefig.dpi': 300,
+            'pdf.fonttype': 42, 'ps.fonttype': 42, 'savefig.bbox': 'tight'})
+if 'panel_letter' not in globals():
+    def panel_letter(ax, letter, case='lower'):
+        """Bold panel letter at the top-left corner of an axes."""
+        ax.text(-0.18, 1.08, letter.lower() if case == 'lower' else letter.upper(),
+                transform=ax.transAxes, fontsize=9, fontweight='bold', va='bottom', ha='left')
+
 import numpy as np, matplotlib as mpl, matplotlib.pyplot as plt, os
 from matplotlib.colors import TwoSlopeNorm
 os.makedirs('figs', exist_ok=True)

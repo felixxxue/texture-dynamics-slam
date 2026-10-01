@@ -1,0 +1,8 @@
+# Python 3.12.14; versions used for the paper
+numpy==2.5.3
+scipy==1.18.1
+pandas==3.0.6
+matplotlib==3.11.2
+opencv-python-headless==5.0.0.93
+open3d==0.20.0
+evo==1.37.1
