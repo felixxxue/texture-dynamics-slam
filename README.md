@@ -6,18 +6,18 @@ The study renders 24 synthetic indoor sequences in which surface texture (L0–L
 
 ## Contents
 
-| Path | Description |
-|---|---|
-| `sim/render.py` | CPU ray-caster (Open3D `RaycastingScene`) that writes stereo, depth, dynamic masks, ground truth, texture metrics and ORB-SLAM2 settings |
-| `sim/run_grid.py` | Runs the full grid (render → run → evaluate → delete images) |
-| `sim/evaluate.py` | ATE (SE(3) alignment) and RPE (1 m) with evo, completeness, per-keypoint P/R/FRR |
-| `sim/analyze.py`, `sim/make_figs.py` | Tables, statistics (`results/stats.json`) and figures |
-| `orbslam2/orbslam2_study.patch` | Patch against ORB-SLAM2 commit `f2e6f51cdc8d067655d90a78c06261378e07e8f3`: Windows/OpenCV-4 portability, headless build, binary vocabulary, FLOW/GEOM filters and logging |
-| `orbslam2/DynFilter.cc`, `orbslam2/tools/` | The filter source and the sequence driver (`run_seq`) / vocabulary converter |
-| `orbslam2/build_orb.py` | MSVC build script used for the paper (adapt the paths) |
-| `results/` | One row per run (`runs.csv`), aggregated tables, per-sequence metadata (ground truth, texture statistics) |
-| `data/run_logs.zip` | Per-run frame logs (`frames.csv`), estimated trajectories (`traj.txt`) and example frames |
-| `figures/` | Figures 2–4 of the paper |
+| Path                                       | Description                                                                                                                                                               |
+| ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `sim/render.py`                            | CPU ray-caster (Open3D `RaycastingScene`) that writes stereo, depth, dynamic masks, ground truth, texture metrics and ORB-SLAM2 settings                                  |
+| `sim/run_grid.py`                          | Runs the full grid (render → run → evaluate → delete images)                                                                                                              |
+| `sim/evaluate.py`                          | ATE (SE(3) alignment) and RPE (1 m) with evo, completeness, per-keypoint P/R/FRR                                                                                          |
+| `sim/analyze.py`, `sim/make_figs.py`       | Tables, statistics (`results/stats.json`) and figures                                                                                                                     |
+| `orbslam2/orbslam2_study.patch`            | Patch against ORB-SLAM2 commit `f2e6f51cdc8d067655d90a78c06261378e07e8f3`: Windows/OpenCV-4 portability, headless build, binary vocabulary, FLOW/GEOM filters and logging |
+| `orbslam2/DynFilter.cc`, `orbslam2/tools/` | The filter source and the sequence driver (`run_seq`) / vocabulary converter                                                                                              |
+| `orbslam2/build_orb.py`                    | MSVC build script used for the paper (adapt the paths)                                                                                                                    |
+| `results/`                                 | One row per run (`runs.csv`), aggregated tables, per-sequence metadata (ground truth, texture statistics)                                                                 |
+| `data/run_logs.zip`                        | Per-run frame logs (`frames.csv`), estimated trajectories (`traj.txt`) and example frames                                                                                 |
+| `figures/`                                 | Figures 2–4 of the paper                                                                                                                                                  |
 
 Rendered images are not stored. `sim/render.py` regenerates every sequence deterministically.
 
@@ -25,19 +25,19 @@ Rendered images are not stored. `sim/render.py` regenerates every sequence deter
 
 Every table, figure and number in the paper is either stored in a committed file under `results/` or recomputed from those files by `sim/analyze.py` / `sim/make_figs.py`. From the repository root, `python sim/make_figs.py` (which calls `sim/analyze.py`) regenerates all tables, `results/stats.json` and Figures 2–4 from the committed `results/runs.csv`, `results/seq_stats.csv` and `data/run_logs.zip` in about 10 s; no SLAM re-run is needed. Re-running it reproduces `stats.json`, `table_main.csv`, `table_texture.csv`, `delta_ate_cells.csv` and `latex_tables.tex` byte for byte. Figure styling may differ slightly from the committed PDFs.
 
-| Paper | Produced by | Data |
-|---|---|---|
-| Table I (positioning) | literature, no data | — |
-| Table II (texture and dynamics per level: β, N̄_F, H_grad, keypoints, dynamic-pixel ratio) | `sim/analyze.py` | `results/table_texture.csv`, `results/seq_stats.csv`, `results/beta_calibration.csv` |
-| Table III (main grid: ATE / completeness C / failures) | `sim/analyze.py` | `results/table_main.csv` (LaTeX: `results/latex_tables.tex`) |
-| Table IV (P, R, FRR, static inliers at D2) | `sim/analyze.py` | `results/latex_tables.tex`, `results/stats.json` |
-| Fig. 1 (pipeline schematic) | drawn in LaTeX | — |
-| Fig. 2 (frames L0–L3) | `sim/make_figs.py` (re-renders frame 180 with `sim/render.py`) | `figures/fig2_frames.pdf` |
-| Fig. 3 (ΔATE heat maps, Holm-corrected tests) | `sim/make_figs.py` | `results/delta_ate_cells.csv`, `results/per_scene_cells.csv`, `results/stats.json` |
-| Fig. 4 (FRR vs texture, mechanism) | `sim/make_figs.py` | `results/runs.csv`, `results/stats.json` |
-| Sec. IV numbers (Spearman ρ, Holm p-values, median FRR, completeness changes, stereo-depth fraction, run times) | `sim/analyze.py` | `results/stats.json`, `results/runs.csv` |
-| Per-run logs, trajectories | `sim/run_grid.py` | `data/run_logs.zip`, `results/grid_log.txt` |
-| Paper PDF and LaTeX source | — | `paper/main.pdf`, `paper/main.tex`, `paper/main.bbl`, `paper/refs.bib` |
+| Paper                                                                                                           | Produced by                                                    | Data                                                                                 |
+| --------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------- | ------------------------------------------------------------------------------------ |
+| Table I (positioning)                                                                                           | literature, no data                                            | —                                                                                    |
+| Table II (texture and dynamics per level: β, N̄_F, H_grad, keypoints, dynamic-pixel ratio)                      | `sim/analyze.py`                                               | `results/table_texture.csv`, `results/seq_stats.csv`, `results/beta_calibration.csv` |
+| Table III (main grid: ATE / completeness C / failures)                                                          | `sim/analyze.py`                                               | `results/table_main.csv` (LaTeX: `results/latex_tables.tex`)                         |
+| Table IV (P, R, FRR, static inliers at D2)                                                                      | `sim/analyze.py`                                               | `results/latex_tables.tex`, `results/stats.json`                                     |
+| Fig. 1 (pipeline schematic)                                                                                     | drawn in LaTeX                                                 | —                                                                                    |
+| Fig. 2 (frames L0–L3)                                                                                           | `sim/make_figs.py` (re-renders frame 180 with `sim/render.py`) | `figures/fig2_frames.pdf`                                                            |
+| Fig. 3 (ΔATE heat maps, Holm-corrected tests)                                                                   | `sim/make_figs.py`                                             | `results/delta_ate_cells.csv`, `results/per_scene_cells.csv`, `results/stats.json`   |
+| Fig. 4 (FRR vs texture, mechanism)                                                                              | `sim/make_figs.py`                                             | `results/runs.csv`, `results/stats.json`                                             |
+| Sec. IV numbers (Spearman ρ, Holm p-values, median FRR, completeness changes, stereo-depth fraction, run times) | `sim/analyze.py`                                               | `results/stats.json`, `results/runs.csv`                                             |
+| Per-run logs, trajectories                                                                                      | `sim/run_grid.py`                                              | `data/run_logs.zip`, `results/grid_log.txt`                                          |
+| Paper PDF and LaTeX source                                                                                      | —                                                              | `paper/main.pdf`, `paper/main.tex`, `paper/main.bbl`, `paper/refs.bib`               |
 
 Pinned Python dependencies: `requirements.txt` (`pip install -r requirements.txt`).
 
@@ -55,6 +55,4 @@ Filter parameters, the renderer settings and the protocol are described in Sec. 
 - Code: **GPL-3.0**, see `LICENSE` (the ORB-SLAM2 patch is a derivative of GPLv3 ORB-SLAM2).
 - Data and results (`results/`, `data/`, `figures/`): **CC BY 4.0**, see `DATA_LICENSE.md`. All textures and scenes are procedural; no third-party assets are used.
 
-## Citation
 
-See `CITATION.cff`. The arXiv identifier will be added after publication.
