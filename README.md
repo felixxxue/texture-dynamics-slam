@@ -1,6 +1,6 @@
 # Dynamic-point filtering under controlled texture (ORB-SLAM2)
 
-Code, results and run logs for the paper ([PDF](paper/main.pdf)) *"Does Dynamic-Point Filtering Help When Texture Is Scarce? A Controlled Study of ORB-SLAM2 Front-Ends in Synthetic Indoor Scenes"* (Zekui Xue, University of Bath; extended from the author's 2022 MSc dissertation).
+Code, results and run logs for the paper ([PDF](paper/main.pdf)) *"Does Dynamic-Point Filtering Help When Texture Is Scarce? A Controlled Study of ORB-SLAM2 Front-Ends in Synthetic Indoor Scenes"* (Zekui Xue, University of Bath, 2022 MSc dissertation).
 
 The study renders 24 synthetic indoor sequences in which surface texture (L0–L3) and scene dynamics (D0–D2, 0/1/3 moving agents) are varied factorially along identical camera trajectories. It then runs ORB-SLAM2 (stereo and RGB-D) without filtering (NONE), with an optical-flow and epipolar-residual filter (FLOW), and with a multi-view depth-consistency filter (GEOM): 2 scenes × 4 × 3 × 3 filters × 2 sensors × 5 runs = 720 runs.
 
@@ -54,5 +54,3 @@ Filter parameters, the renderer settings and the protocol are described in Sec. 
 
 - Code: **GPL-3.0**, see `LICENSE` (the ORB-SLAM2 patch is a derivative of GPLv3 ORB-SLAM2).
 - Data and results (`results/`, `data/`, `figures/`): **CC BY 4.0**, see `DATA_LICENSE.md`. All textures and scenes are procedural; no third-party assets are used.
-
-
