@@ -1,0 +1,1213 @@
+--- a/src/DynFilter.cc
++++ b/src/DynFilter.cc
+@@ -0,0 +1,289 @@
++// [study] Dynamic-point filters (FLOW, GEOM) and per-frame evaluation logging for ORB-SLAM2.
++// Written for "Does Dynamic-Point Filtering Help When Texture Is Scarce?".
++// The ground-truth mask is used ONLY for logging decisions; it never influences tracking.
++#include "Tracking.h"
++#include "Frame.h"
++#include "KeyFrame.h"
++#include "MapPoint.h"
++#include "Map.h"
++#include "System.h"
++#include <opencv2/video/tracking.hpp>
++#include <opencv2/calib3d.hpp>
++#include <deque>
++#include <cmath>
++#include <algorithm>
++
++namespace ORB_SLAM2
++{
++
++// ---------------------------------------------------------------------------------------------
++void Frame::RemoveKeypoints(const std::vector<bool> &vbRemove)
++{
++    std::vector<int> keep; keep.reserve(N);
++    for(int i=0;i<N;i++) if(!vbRemove[i]) keep.push_back(i);
++    const int M = (int)keep.size();
++    std::vector<cv::KeyPoint> k(M), ku(M);
++    std::vector<float> ur(M), d(M);
++    std::vector<MapPoint*> mp(M);
++    std::vector<bool> out(M);
++    cv::Mat desc(M, mDescriptors.cols, mDescriptors.type());
++    for(int j=0;j<M;j++)
++    {
++        const int i = keep[j];
++        k[j]=mvKeys[i]; ku[j]=mvKeysUn[i]; ur[j]=mvuRight[i]; d[j]=mvDepth[i];
++        mp[j]=mvpMapPoints[i]; out[j]=mvbOutlier[i];
++        mDescriptors.row(i).copyTo(desc.row(j));
++    }
++    mvKeys=k; mvKeysUn=ku; mvuRight=ur; mvDepth=d; mvpMapPoints=mp; mvbOutlier=out; mDescriptors=desc;
++    N = M;
++    mBowVec.clear(); mFeatVec.clear();
++    for(unsigned int i=0; i<FRAME_GRID_COLS;i++)
++        for (unsigned int j=0; j<FRAME_GRID_ROWS;j++)
++            mGrid[i][j].clear();
++    AssignFeaturesToGrid();
++}
++
++// ---------------------------------------------------------------------------------------------
++bool Tracking::IsGTDynamic(const cv::KeyPoint &kp) const
++{
++    if(mGTMask.empty()) return false;
++    int x = cvRound(kp.pt.x), y = cvRound(kp.pt.y);
++    if(x<0 || y<0 || x>=mGTMask.cols || y>=mGTMask.rows) return false;
++    return mGTMask.at<uchar>(y,x) > 0;
++}
++
++void Tracking::CountDecisions(const std::vector<bool> &vbDyn, bool ran)
++{
++    mStats.ran = ran ? 1 : 0;
++    mStats.TP = mStats.FP = mStats.FN = mStats.TN = 0;
++    for(int i=0;i<mCurrentFrame.N;i++)
++    {
++        const bool gt = IsGTDynamic(mCurrentFrame.mvKeysUn[i]);
++        const bool pr = vbDyn[i];
++        if(gt && pr) mStats.TP++; else if(!gt && pr) mStats.FP++;
++        else if(gt && !pr) mStats.FN++; else mStats.TN++;
++    }
++}
++
++void Tracking::PreTrackFilter()
++{
++    mStats = FrameStats();
++    mStats.N = mCurrentFrame.N;
++    for(int i=0;i<mCurrentFrame.N;i++) if(mCurrentFrame.mvDepth[i]>0) mStats.nDepth++;
++    std::vector<bool> vbDyn(mCurrentFrame.N,false);
++    if(mDynCfg.type==1 && !mPrevGray.empty())
++    {
++        vbDyn = FlowFilter();
++        CountDecisions(vbDyn, true);
++        bool bAny=false; for(size_t i=0;i<vbDyn.size();i++) bAny = bAny || vbDyn[i];
++        if(bAny) mCurrentFrame.RemoveKeypoints(vbDyn);
++    }
++    else
++        CountDecisions(vbDyn, false);   // NONE, GEOM (overwritten in Track if GEOM runs), or first frame
++}
++
++// ---------------------------------------------------------------------------------------------
++// FLOW: backward pyramidal LK to frame t-1, RANSAC fundamental matrix, point-to-epipolar-line residual.
++std::vector<bool> Tracking::FlowFilter()
++{
++    const int N = mCurrentFrame.N;
++    std::vector<bool> vbDyn(N,false);
++    if(N<8) return vbDyn;
++    std::vector<cv::Point2f> cur(N), prev;
++    for(int i=0;i<N;i++) cur[i]=mCurrentFrame.mvKeysUn[i].pt;
++    std::vector<uchar> status; std::vector<float> err;
++    cv::calcOpticalFlowPyrLK(mImGray, mPrevGray, cur, prev, status, err,
++                             cv::Size(mDynCfg.lkWin,mDynCfg.lkWin), mDynCfg.lkLevels-1,
++                             cv::TermCriteria(cv::TermCriteria::COUNT+cv::TermCriteria::EPS,30,0.01));
++    const float W = (float)mImGray.cols, H = (float)mImGray.rows, b = mDynCfg.border;
++    std::vector<int> idx; std::vector<cv::Point2f> pc, pp;
++    for(int i=0;i<N;i++)
++    {
++        if(!status[i] || err[i]>mDynCfg.lkErr) continue;
++        const cv::Point2f &a=cur[i], &q=prev[i];
++        if(a.x<b || a.y<b || a.x>W-1-b || a.y>H-1-b) continue;
++        if(q.x<b || q.y<b || q.x>W-1-b || q.y>H-1-b) continue;
++        idx.push_back(i); pc.push_back(a); pp.push_back(q);
++    }
++    if(idx.size()<15) return vbDyn;
++    cv::Mat inl;
++    cv::Mat F = cv::findFundamentalMat(pp, pc, cv::FM_RANSAC, mDynCfg.ransacF, 0.99, inl);
++    if(F.empty() || F.rows!=3) return vbDyn;
++    F.convertTo(F, CV_64F);
++    const double *f = F.ptr<double>(0);
++    for(size_t j=0;j<idx.size();j++)
++    {
++        const double x1=pp[j].x, y1=pp[j].y, x2=pc[j].x, y2=pc[j].y;
++        // epipolar line in the current image: l = F * x'
++        const double l1=f[0]*x1+f[1]*y1+f[2], l2=f[3]*x1+f[4]*y1+f[5], l3=f[6]*x1+f[7]*y1+f[8];
++        const double den = std::sqrt(l1*l1+l2*l2);
++        if(den<1e-12) continue;
++        const double dist = std::fabs(x2*l1+y2*l2+l3)/den;
++        if(dist>mDynCfg.tauEpi) vbDyn[idx[j]]=true;
++    }
++    if(mDynCfg.rf>0.f)
++    {
++        std::vector<bool> vbR = vbDyn;
++        for(int i=0;i<N;i++) if(vbDyn[i])
++        {
++            std::vector<size_t> near = mCurrentFrame.GetFeaturesInArea(cur[i].x,cur[i].y,mDynCfg.rf);
++            for(size_t k=0;k<near.size();k++) vbR[near[k]]=true;
++        }
++        vbDyn = vbR;
++    }
++    return vbDyn;
++}
++
++// ---------------------------------------------------------------------------------------------
++// GEOM: multi-view depth consistency against the Ko keyframes that share most map points.
++std::vector<bool> Tracking::GeomFilter()
++{
++    const int N = mCurrentFrame.N;
++    std::vector<bool> vbDyn(N,false);
++    // 1. overlapping keyframes from the preliminary matches
++    std::map<KeyFrame*,int> counter;
++    for(int i=0;i<N;i++)
++    {
++        MapPoint* pMP = mCurrentFrame.mvpMapPoints[i];
++        if(!pMP || mCurrentFrame.mvbOutlier[i] || pMP->isBad()) continue;
++        const std::map<KeyFrame*,size_t> obs = pMP->GetObservations();
++        for(std::map<KeyFrame*,size_t>::const_iterator it=obs.begin(); it!=obs.end(); ++it) counter[it->first]++;
++    }
++    std::vector<std::pair<int,KeyFrame*> > v;
++    for(std::map<KeyFrame*,int>::iterator it=counter.begin(); it!=counter.end(); ++it)
++        if(!it->first->isBad()) v.push_back(std::make_pair(it->second,it->first));
++    std::sort(v.begin(), v.end(), [](const std::pair<int,KeyFrame*>&a, const std::pair<int,KeyFrame*>&b){ return a.first>b.first; });
++    if((int)v.size()>mDynCfg.Ko) v.resize(mDynCfg.Ko);
++    if(v.empty()) return vbDyn;
++
++    const cv::Mat Tcw = mCurrentFrame.mTcw;
++    const cv::Mat Rcw = Tcw.rowRange(0,3).colRange(0,3), tcw = Tcw.rowRange(0,3).col(3);
++    const cv::Mat Ow = -Rcw.t()*tcw;
++    const float cosMax = std::cos(mDynCfg.alphaMaxDeg*(float)CV_PI/180.f);
++    const float W = (float)mImGray.cols, H = (float)mImGray.rows;
++    const bool rgbd = (mSensor==System::RGBD) && !mCurDepth.empty();
++    std::vector<cv::Point2f> seeds;
++    for(size_t kk=0; kk<v.size(); kk++)
++    {
++        KeyFrame* pKF = v[kk].second;
++        const cv::Mat Okf = pKF->GetCameraCenter();
++        for(int i=0;i<pKF->N;i++)
++        {
++            if(pKF->mvDepth[i]<=0) continue;
++            cv::Mat X = pKF->UnprojectStereo(i);
++            if(X.empty()) continue;
++            cv::Mat Xc = Rcw*X + tcw;
++            const float z = Xc.at<float>(2);
++            if(z<=0.05f) continue;
++            const float u = Frame::fx*Xc.at<float>(0)/z + Frame::cx, vv = Frame::fy*Xc.at<float>(1)/z + Frame::cy;
++            if(u<0 || vv<0 || u>W-1 || vv>H-1) continue;
++            cv::Mat r1 = X-Okf, r2 = X-Ow;
++            const float c = (float)(r1.dot(r2)/(cv::norm(r1)*cv::norm(r2)+1e-12));
++            if(c<cosMax) continue;               // parallax > alpha_max: possible self-occlusion
++            float zm = -1.f; cv::Point2f sp(u,vv);
++            // Measured depth z' at x': the FARTHEST valid depth in a small neighbourhood, so that a projection
++            // that lands on the foreground side of a depth edge (sub-pixel pose/rounding error) is not a seed.
++            if(rgbd)
++            {
++                const int cu=cvRound(u), cv_=cvRound(vv), r=mDynCfg.patchR;
++                for(int yy=std::max(0,cv_-r); yy<=std::min(mCurDepth.rows-1,cv_+r); yy++)
++                    for(int xx=std::max(0,cu-r); xx<=std::min(mCurDepth.cols-1,cu+r); xx++)
++                        zm = std::max(zm, mCurDepth.at<float>(yy,xx));
++            }
++            else
++            {
++                std::vector<size_t> near = mCurrentFrame.GetFeaturesInArea(u,vv,mDynCfg.stereoAssoc);
++                float best=1e9f;
++                for(size_t q=0;q<near.size();q++)
++                {
++                    const float dq = mCurrentFrame.mvDepth[near[q]];
++                    if(dq<=0) continue;
++                    zm = std::max(zm, dq);
++                    const cv::KeyPoint &kp = mCurrentFrame.mvKeysUn[near[q]];
++                    const float dd = (kp.pt.x-u)*(kp.pt.x-u)+(kp.pt.y-vv)*(kp.pt.y-vv);
++                    if(dd<best){ best=dd; sp=kp.pt; }
++                }
++            }
++            if(zm<=0) continue;
++            if(z - zm > mDynCfg.tauZ) seeds.push_back(sp);  // something closer than the static surface
++        }
++    }
++    mStats.nSeeds = (int)seeds.size();
++    if(seeds.empty()) return vbDyn;
++
++    if(rgbd)
++    {
++        // region growing on the depth image from each seed (4-neighbourhood, depth step < tauG),
++        // limited to growMax pixels (Chebyshev distance) from the seed
++        cv::Mat mask = cv::Mat::zeros(mCurDepth.size(), CV_8U);
++        const int R = mDynCfg.growMax;
++        for(size_t s=0;s<seeds.size();s++)
++        {
++            const int sx=cvRound(seeds[s].x), sy=cvRound(seeds[s].y);
++            if(mask.at<uchar>(sy,sx)) continue;
++            if(mCurDepth.at<float>(sy,sx)<=0) continue;
++            std::deque<cv::Point> q; q.push_back(cv::Point(sx,sy)); mask.at<uchar>(sy,sx)=255;
++            while(!q.empty())
++            {
++                cv::Point p=q.front(); q.pop_front();
++                const float dp = mCurDepth.at<float>(p.y,p.x);
++                const int nx[4]={p.x+1,p.x-1,p.x,p.x}, ny[4]={p.y,p.y,p.y+1,p.y-1};
++                for(int k=0;k<4;k++)
++                {
++                    const int x=nx[k], y=ny[k];
++                    if(x<0||y<0||x>=mask.cols||y>=mask.rows) continue;
++                    if(std::abs(x-sx)>R || std::abs(y-sy)>R) continue;
++                    if(mask.at<uchar>(y,x)) continue;
++                    const float dn = mCurDepth.at<float>(y,x);
++                    if(dn<=0 || std::fabs(dn-dp)>=mDynCfg.tauG) continue;
++                    mask.at<uchar>(y,x)=255; q.push_back(cv::Point(x,y));
++                }
++            }
++        }
++        for(int i=0;i<N;i++)
++        {
++            const cv::Point2f &pt = mCurrentFrame.mvKeysUn[i].pt;
++            const int x=cvRound(pt.x), y=cvRound(pt.y);
++            if(x>=0&&y>=0&&x<mask.cols&&y<mask.rows && mask.at<uchar>(y,x)) vbDyn[i]=true;
++        }
++    }
++    else
++    {
++        for(size_t s=0;s<seeds.size();s++)
++        {
++            std::vector<size_t> near = mCurrentFrame.GetFeaturesInArea(seeds[s].x,seeds[s].y,mDynCfg.rg);
++            for(size_t k=0;k<near.size();k++) vbDyn[near[k]]=true;
++        }
++    }
++    return vbDyn;
++}
++
++// ---------------------------------------------------------------------------------------------
++void Tracking::OpenLog(const std::string &path)
++{
++    mpLogFile = fopen(path.c_str(),"w");
++    if(mpLogFile) fprintf(mpLogFile,"frame,t,state,N,ran,TP,FP,FN,TN,nDepth,nSeeds,nKept,nInl,nInlStatic,nKF,nMP,resets\n");
++}
++void Tracking::CloseLog(){ if(mpLogFile){ fclose(mpLogFile); mpLogFile=nullptr; } }
++
++void Tracking::LogFrame()
++{
++    if(!mpLogFile) return;
++    int nInl=0, nInlS=0;
++    if(mState==OK)
++        for(int i=0;i<mCurrentFrame.N;i++)
++        {
++            MapPoint* pMP = mCurrentFrame.mvpMapPoints[i];
++            if(pMP && !mCurrentFrame.mvbOutlier[i])
++            {
++                nInl++;
++                if(!IsGTDynamic(mCurrentFrame.mvKeysUn[i])) nInlS++;
++            }
++        }
++    fprintf(mpLogFile,"%lu,%.6f,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d\n",
++            mCurrentFrame.mnId, mCurrentFrame.mTimeStamp, (int)mState, mStats.N, mStats.ran,
++            mStats.TP, mStats.FP, mStats.FN, mStats.TN, mStats.nDepth, mStats.nSeeds, mCurrentFrame.N,
++            nInl, nInlS, (int)mpMap->KeyFramesInMap(), (int)mpMap->MapPointsInMap(), mnResets);
++}
++
++} // namespace ORB_SLAM2
+--- a/src/FrameDrawer.cc
++++ b/src/FrameDrawer.cc
+@@ -1,3 +1,5 @@
++#include <opencv2/imgproc/types_c.h>
++#include <opencv2/imgproc.hpp>
+ /**
+ * This file is part of ORB-SLAM2.
+ *
+--- a/src/LocalMapping.cc
++++ b/src/LocalMapping.cc
+@@ -1,3 +1,4 @@
++#include <unistd.h>
+ /**
+ * This file is part of ORB-SLAM2.
+ *
+--- a/src/LoopClosing.cc
++++ b/src/LoopClosing.cc
+@@ -1,3 +1,4 @@
++#include <unistd.h>
+ /**
+ * This file is part of ORB-SLAM2.
+ *
+--- a/src/MapDrawer.cc
++++ b/src/MapDrawer.cc
+@@ -1,264 +1,9 @@
+-/**
+-* This file is part of ORB-SLAM2.
+-*
+-* Copyright (C) 2014-2016 Raúl Mur-Artal <raulmur at unizar dot es> (University of Zaragoza)
+-* For more information see <https://github.com/raulmur/ORB_SLAM2>
+-*
+-* ORB-SLAM2 is free software: you can redistribute it and/or modify
+-* it under the terms of the GNU General Public License as published by
+-* the Free Software Foundation, either version 3 of the License, or
+-* (at your option) any later version.
+-*
+-* ORB-SLAM2 is distributed in the hope that it will be useful,
+-* but WITHOUT ANY WARRANTY; without even the implied warranty of
+-* MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+-* GNU General Public License for more details.
+-*
+-* You should have received a copy of the GNU General Public License
+-* along with ORB-SLAM2. If not, see <http://www.gnu.org/licenses/>.
+-*/
+-
++// Headless stub of MapDrawer (Pangolin drawing removed for the Windows build).
+ #include "MapDrawer.h"
+-#include "MapPoint.h"
+-#include "KeyFrame.h"
+-#include <pangolin/pangolin.h>
+-#include <mutex>
+-
+-namespace ORB_SLAM2
+-{
+-
+-
+-MapDrawer::MapDrawer(Map* pMap, const string &strSettingPath):mpMap(pMap)
+-{
+-    cv::FileStorage fSettings(strSettingPath, cv::FileStorage::READ);
+-
+-    mKeyFrameSize = fSettings["Viewer.KeyFrameSize"];
+-    mKeyFrameLineWidth = fSettings["Viewer.KeyFrameLineWidth"];
+-    mGraphLineWidth = fSettings["Viewer.GraphLineWidth"];
+-    mPointSize = fSettings["Viewer.PointSize"];
+-    mCameraSize = fSettings["Viewer.CameraSize"];
+-    mCameraLineWidth = fSettings["Viewer.CameraLineWidth"];
+-
++namespace ORB_SLAM2 {
++MapDrawer::MapDrawer(Map* pMap, const string &strSettingPath):mpMap(pMap){}
++void MapDrawer::DrawMapPoints(){}
++void MapDrawer::DrawKeyFrames(const bool, const bool){}
++void MapDrawer::SetCurrentCameraPose(const cv::Mat &Tcw){ unique_lock<mutex> lock(mMutexCamera); mCameraPose = Tcw.clone(); }
++void MapDrawer::SetReferenceKeyFrame(KeyFrame *pKF){}
+ }
+-
+-void MapDrawer::DrawMapPoints()
+-{
+-    const vector<MapPoint*> &vpMPs = mpMap->GetAllMapPoints();
+-    const vector<MapPoint*> &vpRefMPs = mpMap->GetReferenceMapPoints();
+-
+-    set<MapPoint*> spRefMPs(vpRefMPs.begin(), vpRefMPs.end());
+-
+-    if(vpMPs.empty())
+-        return;
+-
+-    glPointSize(mPointSize);
+-    glBegin(GL_POINTS);
+-    glColor3f(0.0,0.0,0.0);
+-
+-    for(size_t i=0, iend=vpMPs.size(); i<iend;i++)
+-    {
+-        if(vpMPs[i]->isBad() || spRefMPs.count(vpMPs[i]))
+-            continue;
+-        cv::Mat pos = vpMPs[i]->GetWorldPos();
+-        glVertex3f(pos.at<float>(0),pos.at<float>(1),pos.at<float>(2));
+-    }
+-    glEnd();
+-
+-    glPointSize(mPointSize);
+-    glBegin(GL_POINTS);
+-    glColor3f(1.0,0.0,0.0);
+-
+-    for(set<MapPoint*>::iterator sit=spRefMPs.begin(), send=spRefMPs.end(); sit!=send; sit++)
+-    {
+-        if((*sit)->isBad())
+-            continue;
+-        cv::Mat pos = (*sit)->GetWorldPos();
+-        glVertex3f(pos.at<float>(0),pos.at<float>(1),pos.at<float>(2));
+-
+-    }
+-
+-    glEnd();
+-}
+-
+-void MapDrawer::DrawKeyFrames(const bool bDrawKF, const bool bDrawGraph)
+-{
+-    const float &w = mKeyFrameSize;
+-    const float h = w*0.75;
+-    const float z = w*0.6;
+-
+-    const vector<KeyFrame*> vpKFs = mpMap->GetAllKeyFrames();
+-
+-    if(bDrawKF)
+-    {
+-        for(size_t i=0; i<vpKFs.size(); i++)
+-        {
+-            KeyFrame* pKF = vpKFs[i];
+-            cv::Mat Twc = pKF->GetPoseInverse().t();
+-
+-            glPushMatrix();
+-
+-            glMultMatrixf(Twc.ptr<GLfloat>(0));
+-
+-            glLineWidth(mKeyFrameLineWidth);
+-            glColor3f(0.0f,0.0f,1.0f);
+-            glBegin(GL_LINES);
+-            glVertex3f(0,0,0);
+-            glVertex3f(w,h,z);
+-            glVertex3f(0,0,0);
+-            glVertex3f(w,-h,z);
+-            glVertex3f(0,0,0);
+-            glVertex3f(-w,-h,z);
+-            glVertex3f(0,0,0);
+-            glVertex3f(-w,h,z);
+-
+-            glVertex3f(w,h,z);
+-            glVertex3f(w,-h,z);
+-
+-            glVertex3f(-w,h,z);
+-            glVertex3f(-w,-h,z);
+-
+-            glVertex3f(-w,h,z);
+-            glVertex3f(w,h,z);
+-
+-            glVertex3f(-w,-h,z);
+-            glVertex3f(w,-h,z);
+-            glEnd();
+-
+-            glPopMatrix();
+-        }
+-    }
+-
+-    if(bDrawGraph)
+-    {
+-        glLineWidth(mGraphLineWidth);
+-        glColor4f(0.0f,1.0f,0.0f,0.6f);
+-        glBegin(GL_LINES);
+-
+-        for(size_t i=0; i<vpKFs.size(); i++)
+-        {
+-            // Covisibility Graph
+-            const vector<KeyFrame*> vCovKFs = vpKFs[i]->GetCovisiblesByWeight(100);
+-            cv::Mat Ow = vpKFs[i]->GetCameraCenter();
+-            if(!vCovKFs.empty())
+-            {
+-                for(vector<KeyFrame*>::const_iterator vit=vCovKFs.begin(), vend=vCovKFs.end(); vit!=vend; vit++)
+-                {
+-                    if((*vit)->mnId<vpKFs[i]->mnId)
+-                        continue;
+-                    cv::Mat Ow2 = (*vit)->GetCameraCenter();
+-                    glVertex3f(Ow.at<float>(0),Ow.at<float>(1),Ow.at<float>(2));
+-                    glVertex3f(Ow2.at<float>(0),Ow2.at<float>(1),Ow2.at<float>(2));
+-                }
+-            }
+-
+-            // Spanning tree
+-            KeyFrame* pParent = vpKFs[i]->GetParent();
+-            if(pParent)
+-            {
+-                cv::Mat Owp = pParent->GetCameraCenter();
+-                glVertex3f(Ow.at<float>(0),Ow.at<float>(1),Ow.at<float>(2));
+-                glVertex3f(Owp.at<float>(0),Owp.at<float>(1),Owp.at<float>(2));
+-            }
+-
+-            // Loops
+-            set<KeyFrame*> sLoopKFs = vpKFs[i]->GetLoopEdges();
+-            for(set<KeyFrame*>::iterator sit=sLoopKFs.begin(), send=sLoopKFs.end(); sit!=send; sit++)
+-            {
+-                if((*sit)->mnId<vpKFs[i]->mnId)
+-                    continue;
+-                cv::Mat Owl = (*sit)->GetCameraCenter();
+-                glVertex3f(Ow.at<float>(0),Ow.at<float>(1),Ow.at<float>(2));
+-                glVertex3f(Owl.at<float>(0),Owl.at<float>(1),Owl.at<float>(2));
+-            }
+-        }
+-
+-        glEnd();
+-    }
+-}
+-
+-void MapDrawer::DrawCurrentCamera(pangolin::OpenGlMatrix &Twc)
+-{
+-    const float &w = mCameraSize;
+-    const float h = w*0.75;
+-    const float z = w*0.6;
+-
+-    glPushMatrix();
+-
+-#ifdef HAVE_GLES
+-        glMultMatrixf(Twc.m);
+-#else
+-        glMultMatrixd(Twc.m);
+-#endif
+-
+-    glLineWidth(mCameraLineWidth);
+-    glColor3f(0.0f,1.0f,0.0f);
+-    glBegin(GL_LINES);
+-    glVertex3f(0,0,0);
+-    glVertex3f(w,h,z);
+-    glVertex3f(0,0,0);
+-    glVertex3f(w,-h,z);
+-    glVertex3f(0,0,0);
+-    glVertex3f(-w,-h,z);
+-    glVertex3f(0,0,0);
+-    glVertex3f(-w,h,z);
+-
+-    glVertex3f(w,h,z);
+-    glVertex3f(w,-h,z);
+-
+-    glVertex3f(-w,h,z);
+-    glVertex3f(-w,-h,z);
+-
+-    glVertex3f(-w,h,z);
+-    glVertex3f(w,h,z);
+-
+-    glVertex3f(-w,-h,z);
+-    glVertex3f(w,-h,z);
+-    glEnd();
+-
+-    glPopMatrix();
+-}
+-
+-
+-void MapDrawer::SetCurrentCameraPose(const cv::Mat &Tcw)
+-{
+-    unique_lock<mutex> lock(mMutexCamera);
+-    mCameraPose = Tcw.clone();
+-}
+-
+-void MapDrawer::GetCurrentOpenGLCameraMatrix(pangolin::OpenGlMatrix &M)
+-{
+-    if(!mCameraPose.empty())
+-    {
+-        cv::Mat Rwc(3,3,CV_32F);
+-        cv::Mat twc(3,1,CV_32F);
+-        {
+-            unique_lock<mutex> lock(mMutexCamera);
+-            Rwc = mCameraPose.rowRange(0,3).colRange(0,3).t();
+-            twc = -Rwc*mCameraPose.rowRange(0,3).col(3);
+-        }
+-
+-        M.m[0] = Rwc.at<float>(0,0);
+-        M.m[1] = Rwc.at<float>(1,0);
+-        M.m[2] = Rwc.at<float>(2,0);
+-        M.m[3]  = 0.0;
+-
+-        M.m[4] = Rwc.at<float>(0,1);
+-        M.m[5] = Rwc.at<float>(1,1);
+-        M.m[6] = Rwc.at<float>(2,1);
+-        M.m[7]  = 0.0;
+-
+-        M.m[8] = Rwc.at<float>(0,2);
+-        M.m[9] = Rwc.at<float>(1,2);
+-        M.m[10] = Rwc.at<float>(2,2);
+-        M.m[11]  = 0.0;
+-
+-        M.m[12] = twc.at<float>(0);
+-        M.m[13] = twc.at<float>(1);
+-        M.m[14] = twc.at<float>(2);
+-        M.m[15]  = 1.0;
+-    }
+-    else
+-        M.SetIdentity();
+-}
+-
+-} //namespace ORB_SLAM
+--- a/src/MapPoint.cc
++++ b/src/MapPoint.cc
+@@ -272,7 +272,7 @@
+     // Compute distances between them
+     const size_t N = vDescriptors.size();
+ 
+-    float Distances[N][N];
++    std::vector<std::vector<float> > Distances(N, std::vector<float>(N,0.f)); // MSVC: no VLAs
+     for(size_t i=0;i<N;i++)
+     {
+         Distances[i][i]=0;
+@@ -289,7 +289,7 @@
+     int BestIdx = 0;
+     for(size_t i=0;i<N;i++)
+     {
+-        vector<int> vDists(Distances[i],Distances[i]+N);
++        vector<int> vDists(Distances[i].begin(),Distances[i].end());
+         sort(vDists.begin(),vDists.end());
+         int median = vDists[0.5*(N-1)];
+ 
+--- a/src/ORBmatcher.cc
++++ b/src/ORBmatcher.cc
+@@ -27,7 +27,7 @@
+ 
+ #include "Thirdparty/DBoW2/DBoW2/FeatureVector.h"
+ 
+-#include<stdint-gcc.h>
++#include <cstdint>
+ 
+ using namespace std;
+ 
+--- a/src/Sim3Solver.cc
++++ b/src/Sim3Solver.cc
+@@ -1,3 +1,4 @@
++#include <opencv2/core/core_c.h>
+ /**
+ * This file is part of ORB-SLAM2.
+ *
+--- a/src/System.cc
++++ b/src/System.cc
+@@ -1,3 +1,4 @@
++#include <unistd.h>
+ /**
+ * This file is part of ORB-SLAM2.
+ *
+@@ -23,7 +24,7 @@
+ #include "System.h"
+ #include "Converter.h"
+ #include <thread>
+-#include <pangolin/pangolin.h>
++
+ #include <iomanip>
+ 
+ namespace ORB_SLAM2
+@@ -62,7 +63,7 @@
+     cout << endl << "Loading ORB Vocabulary. This could take a while..." << endl;
+ 
+     mpVocabulary = new ORBVocabulary();
+-    bool bVocLoad = mpVocabulary->loadFromTextFile(strVocFile);
++    bool bVocLoad = (strVocFile.size()>4 && strVocFile.substr(strVocFile.size()-4)==".bin") ? mpVocabulary->loadFromBinaryFile(strVocFile) : mpVocabulary->loadFromTextFile(strVocFile);
+     if(!bVocLoad)
+     {
+         cerr << "Wrong path to vocabulary. " << endl;
+@@ -315,8 +316,7 @@
+         usleep(5000);
+     }
+ 
+-    if(mpViewer)
+-        pangolin::BindToContext("ORB-SLAM2: Map Viewer");
++    /* viewer removed (headless build) */
+ }
+ 
+ void System::SaveTrajectoryTUM(const string &filename)
+--- a/src/Tracking.cc
++++ b/src/Tracking.cc
+@@ -1,3 +1,5 @@
++#include <opencv2/imgproc/types_c.h>
++#include <unistd.h>
+ /**
+ * This file is part of ORB-SLAM2.
+ *
+@@ -198,7 +200,10 @@
+ 
+     mCurrentFrame = Frame(mImGray,imGrayRight,timestamp,mpORBextractorLeft,mpORBextractorRight,mpORBVocabulary,mK,mDistCoef,mbf,mThDepth);
+ 
++    PreTrackFilter();
+     Track();
++    LogFrame();
++    mPrevGray = mImGray.clone();
+ 
+     return mCurrentFrame.mTcw.clone();
+ }
+@@ -229,7 +234,11 @@
+ 
+     mCurrentFrame = Frame(mImGray,imDepth,timestamp,mpORBextractorLeft,mpORBVocabulary,mK,mDistCoef,mbf,mThDepth);
+ 
++    mCurDepth = imDepth;
++    PreTrackFilter();
+     Track();
++    LogFrame();
++    mPrevGray = mImGray.clone();
+ 
+     return mCurrentFrame.mTcw.clone();
+ }
+@@ -392,6 +401,16 @@
+             }
+         }
+ 
++        // [study] GEOM filter: uses the preliminary pose from standard tracking, then removes flagged
++        // keypoints before local-map tracking and map-point creation.
++        if(mDynCfg.type==2 && bOK)
++        {
++            std::vector<bool> vbDyn = GeomFilter();
++            CountDecisions(vbDyn, true);
++            bool bAny=false; for(size_t i=0;i<vbDyn.size();i++) bAny = bAny || vbDyn[i];
++            if(bAny) mCurrentFrame.RemoveKeypoints(vbDyn);
++        }
++
+         mCurrentFrame.mpReferenceKF = mpReferenceKF;
+ 
+         // If we have an initial estimation of the camera pose and matching. Track the local map.
+@@ -1503,6 +1522,7 @@
+ 
+ void Tracking::Reset()
+ {
++    mnResets++;
+ 
+     cout << "System Reseting" << endl;
+     if(mpViewer)
+--- a/src/Viewer.cc
++++ b/src/Viewer.cc
+@@ -1,232 +1,15 @@
+-/**
+-* This file is part of ORB-SLAM2.
+-*
+-* Copyright (C) 2014-2016 Raúl Mur-Artal <raulmur at unizar dot es> (University of Zaragoza)
+-* For more information see <https://github.com/raulmur/ORB_SLAM2>
+-*
+-* ORB-SLAM2 is free software: you can redistribute it and/or modify
+-* it under the terms of the GNU General Public License as published by
+-* the Free Software Foundation, either version 3 of the License, or
+-* (at your option) any later version.
+-*
+-* ORB-SLAM2 is distributed in the hope that it will be useful,
+-* but WITHOUT ANY WARRANTY; without even the implied warranty of
+-* MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+-* GNU General Public License for more details.
+-*
+-* You should have received a copy of the GNU General Public License
+-* along with ORB-SLAM2. If not, see <http://www.gnu.org/licenses/>.
+-*/
+-
++// Headless stub of Viewer (Pangolin removed for the Windows build). Never instantiated when bUseViewer=false.
+ #include "Viewer.h"
+-#include <pangolin/pangolin.h>
+-
+-#include <mutex>
+-
+-namespace ORB_SLAM2
+-{
+-
++namespace ORB_SLAM2 {
+ Viewer::Viewer(System* pSystem, FrameDrawer *pFrameDrawer, MapDrawer *pMapDrawer, Tracking *pTracking, const string &strSettingPath):
+-    mpSystem(pSystem), mpFrameDrawer(pFrameDrawer),mpMapDrawer(pMapDrawer), mpTracker(pTracking),
+-    mbFinishRequested(false), mbFinished(true), mbStopped(true), mbStopRequested(false)
+-{
+-    cv::FileStorage fSettings(strSettingPath, cv::FileStorage::READ);
+-
+-    float fps = fSettings["Camera.fps"];
+-    if(fps<1)
+-        fps=30;
+-    mT = 1e3/fps;
+-
+-    mImageWidth = fSettings["Camera.width"];
+-    mImageHeight = fSettings["Camera.height"];
+-    if(mImageWidth<1 || mImageHeight<1)
+-    {
+-        mImageWidth = 640;
+-        mImageHeight = 480;
+-    }
+-
+-    mViewpointX = fSettings["Viewer.ViewpointX"];
+-    mViewpointY = fSettings["Viewer.ViewpointY"];
+-    mViewpointZ = fSettings["Viewer.ViewpointZ"];
+-    mViewpointF = fSettings["Viewer.ViewpointF"];
++ mpSystem(pSystem), mpFrameDrawer(pFrameDrawer),mpMapDrawer(pMapDrawer), mpTracker(pTracking), mbFinishRequested(false), mbFinished(true), mbStopped(true), mbStopRequested(false){}
++void Viewer::Run(){ mbFinished=true; }
++void Viewer::RequestFinish(){ mbFinishRequested=true; }
++void Viewer::RequestStop(){ mbStopRequested=true; }
++bool Viewer::isFinished(){ return true; }
++bool Viewer::isStopped(){ return true; }
++void Viewer::Release(){}
++bool Viewer::Stop(){ return true; }
++bool Viewer::CheckFinish(){ return true; }
++void Viewer::SetFinish(){ mbFinished=true; }
+ }
+-
+-void Viewer::Run()
+-{
+-    mbFinished = false;
+-    mbStopped = false;
+-
+-    pangolin::CreateWindowAndBind("ORB-SLAM2: Map Viewer",1024,768);
+-
+-    // 3D Mouse handler requires depth testing to be enabled
+-    glEnable(GL_DEPTH_TEST);
+-
+-    // Issue specific OpenGl we might need
+-    glEnable (GL_BLEND);
+-    glBlendFunc (GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+-
+-    pangolin::CreatePanel("menu").SetBounds(0.0,1.0,0.0,pangolin::Attach::Pix(175));
+-    pangolin::Var<bool> menuFollowCamera("menu.Follow Camera",true,true);
+-    pangolin::Var<bool> menuShowPoints("menu.Show Points",true,true);
+-    pangolin::Var<bool> menuShowKeyFrames("menu.Show KeyFrames",true,true);
+-    pangolin::Var<bool> menuShowGraph("menu.Show Graph",true,true);
+-    pangolin::Var<bool> menuLocalizationMode("menu.Localization Mode",false,true);
+-    pangolin::Var<bool> menuReset("menu.Reset",false,false);
+-
+-    // Define Camera Render Object (for view / scene browsing)
+-    pangolin::OpenGlRenderState s_cam(
+-                pangolin::ProjectionMatrix(1024,768,mViewpointF,mViewpointF,512,389,0.1,1000),
+-                pangolin::ModelViewLookAt(mViewpointX,mViewpointY,mViewpointZ, 0,0,0,0.0,-1.0, 0.0)
+-                );
+-
+-    // Add named OpenGL viewport to window and provide 3D Handler
+-    pangolin::View& d_cam = pangolin::CreateDisplay()
+-            .SetBounds(0.0, 1.0, pangolin::Attach::Pix(175), 1.0, -1024.0f/768.0f)
+-            .SetHandler(new pangolin::Handler3D(s_cam));
+-
+-    pangolin::OpenGlMatrix Twc;
+-    Twc.SetIdentity();
+-
+-    cv::namedWindow("ORB-SLAM2: Current Frame");
+-
+-    bool bFollow = true;
+-    bool bLocalizationMode = false;
+-
+-    while(1)
+-    {
+-        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+-
+-        mpMapDrawer->GetCurrentOpenGLCameraMatrix(Twc);
+-
+-        if(menuFollowCamera && bFollow)
+-        {
+-            s_cam.Follow(Twc);
+-        }
+-        else if(menuFollowCamera && !bFollow)
+-        {
+-            s_cam.SetModelViewMatrix(pangolin::ModelViewLookAt(mViewpointX,mViewpointY,mViewpointZ, 0,0,0,0.0,-1.0, 0.0));
+-            s_cam.Follow(Twc);
+-            bFollow = true;
+-        }
+-        else if(!menuFollowCamera && bFollow)
+-        {
+-            bFollow = false;
+-        }
+-
+-        if(menuLocalizationMode && !bLocalizationMode)
+-        {
+-            mpSystem->ActivateLocalizationMode();
+-            bLocalizationMode = true;
+-        }
+-        else if(!menuLocalizationMode && bLocalizationMode)
+-        {
+-            mpSystem->DeactivateLocalizationMode();
+-            bLocalizationMode = false;
+-        }
+-
+-        d_cam.Activate(s_cam);
+-        glClearColor(1.0f,1.0f,1.0f,1.0f);
+-        mpMapDrawer->DrawCurrentCamera(Twc);
+-        if(menuShowKeyFrames || menuShowGraph)
+-            mpMapDrawer->DrawKeyFrames(menuShowKeyFrames,menuShowGraph);
+-        if(menuShowPoints)
+-            mpMapDrawer->DrawMapPoints();
+-
+-        pangolin::FinishFrame();
+-
+-        cv::Mat im = mpFrameDrawer->DrawFrame();
+-        cv::imshow("ORB-SLAM2: Current Frame",im);
+-        cv::waitKey(mT);
+-
+-        if(menuReset)
+-        {
+-            menuShowGraph = true;
+-            menuShowKeyFrames = true;
+-            menuShowPoints = true;
+-            menuLocalizationMode = false;
+-            if(bLocalizationMode)
+-                mpSystem->DeactivateLocalizationMode();
+-            bLocalizationMode = false;
+-            bFollow = true;
+-            menuFollowCamera = true;
+-            mpSystem->Reset();
+-            menuReset = false;
+-        }
+-
+-        if(Stop())
+-        {
+-            while(isStopped())
+-            {
+-                usleep(3000);
+-            }
+-        }
+-
+-        if(CheckFinish())
+-            break;
+-    }
+-
+-    SetFinish();
+-}
+-
+-void Viewer::RequestFinish()
+-{
+-    unique_lock<mutex> lock(mMutexFinish);
+-    mbFinishRequested = true;
+-}
+-
+-bool Viewer::CheckFinish()
+-{
+-    unique_lock<mutex> lock(mMutexFinish);
+-    return mbFinishRequested;
+-}
+-
+-void Viewer::SetFinish()
+-{
+-    unique_lock<mutex> lock(mMutexFinish);
+-    mbFinished = true;
+-}
+-
+-bool Viewer::isFinished()
+-{
+-    unique_lock<mutex> lock(mMutexFinish);
+-    return mbFinished;
+-}
+-
+-void Viewer::RequestStop()
+-{
+-    unique_lock<mutex> lock(mMutexStop);
+-    if(!mbStopped)
+-        mbStopRequested = true;
+-}
+-
+-bool Viewer::isStopped()
+-{
+-    unique_lock<mutex> lock(mMutexStop);
+-    return mbStopped;
+-}
+-
+-bool Viewer::Stop()
+-{
+-    unique_lock<mutex> lock(mMutexStop);
+-    unique_lock<mutex> lock2(mMutexFinish);
+-
+-    if(mbFinishRequested)
+-        return false;
+-    else if(mbStopRequested)
+-    {
+-        mbStopped = true;
+-        mbStopRequested = false;
+-        return true;
+-    }
+-
+-    return false;
+-
+-}
+-
+-void Viewer::Release()
+-{
+-    unique_lock<mutex> lock(mMutexStop);
+-    mbStopped = false;
+-}
+-
+-}
+--- a/include/Converter.h
++++ b/include/Converter.h
+@@ -21,6 +21,7 @@
+ #ifndef CONVERTER_H
+ #define CONVERTER_H
+ 
++#include <opencv2/core/core_c.h>
+ #include<opencv2/core/core.hpp>
+ 
+ #include<Eigen/Dense>
+--- a/include/Frame.h
++++ b/include/Frame.h
+@@ -97,6 +97,9 @@
+ 
+     // Backprojects a keypoint (if stereo/depth info available) into 3D world coordinates.
+     cv::Mat UnprojectStereo(const int &i);
++
++    // [study] Remove the keypoints flagged in vbRemove (dynamic-point filtering) and rebuild the grid.
++    void RemoveKeypoints(const std::vector<bool> &vbRemove);
+ 
+ public:
+     // Vocabulary used for relocalization.
+--- a/include/LoopClosing.h
++++ b/include/LoopClosing.h
+@@ -47,7 +47,7 @@
+ 
+     typedef pair<set<KeyFrame*>,int> ConsistentGroup;    
+     typedef map<KeyFrame*,g2o::Sim3,std::less<KeyFrame*>,
+-        Eigen::aligned_allocator<std::pair<const KeyFrame*, g2o::Sim3> > > KeyFrameAndPose;
++        Eigen::aligned_allocator<std::pair<KeyFrame* const, g2o::Sim3> > > KeyFrameAndPose;
+ 
+ public:
+ 
+--- a/include/MapDrawer.h
++++ b/include/MapDrawer.h
+@@ -24,7 +24,7 @@
+ #include"Map.h"
+ #include"MapPoint.h"
+ #include"KeyFrame.h"
+-#include<pangolin/pangolin.h>
++
+ 
+ #include<mutex>
+ 
+@@ -40,10 +40,8 @@
+ 
+     void DrawMapPoints();
+     void DrawKeyFrames(const bool bDrawKF, const bool bDrawGraph);
+-    void DrawCurrentCamera(pangolin::OpenGlMatrix &Twc);
+     void SetCurrentCameraPose(const cv::Mat &Tcw);
+     void SetReferenceKeyFrame(KeyFrame *pKF);
+-    void GetCurrentOpenGLCameraMatrix(pangolin::OpenGlMatrix &M);
+ 
+ private:
+ 
+--- a/include/ORBextractor.h
++++ b/include/ORBextractor.h
+@@ -23,7 +23,9 @@
+ 
+ #include <vector>
+ #include <list>
+-#include <opencv/cv.h>
++#include <opencv2/opencv.hpp>
++#include <opencv2/core/core_c.h>
++#include <opencv2/imgproc/types_c.h>
+ 
+ 
+ namespace ORB_SLAM2
+--- a/include/PnPsolver.h
++++ b/include/PnPsolver.h
+@@ -51,6 +51,7 @@
+ #ifndef PNPSOLVER_H
+ #define PNPSOLVER_H
+ 
++#include <opencv2/core/core_c.h>
+ #include <opencv2/core/core.hpp>
+ #include "MapPoint.h"
+ #include "Frame.h"
+--- a/include/System.h
++++ b/include/System.h
+@@ -81,6 +81,9 @@
+     void ActivateLocalizationMode();
+     // This resumes local mapping thread and performs SLAM again.
+     void DeactivateLocalizationMode();
++
++    // [study] access to the tracker (dynamic-filter configuration and logging)
++    Tracking* GetTracker(){ return mpTracker; }
+ 
+     // Returns true if there have been a big map change (loop closure, global BA)
+     // since last call to this function
+--- a/include/Tracking.h
++++ b/include/Tracking.h
+@@ -22,6 +22,7 @@
+ #ifndef TRACKING_H
+ #define TRACKING_H
+ 
++#include <cstdio>
+ #include<opencv2/core/core.hpp>
+ #include<opencv2/features2d/features2d.hpp>
+ 
+@@ -50,9 +51,52 @@
+ class LoopClosing;
+ class System;
+ 
++
++// [study] Configuration of the dynamic-point filter inserted into the tracking front-end.
++struct DynFilterConfig {
++    int type = 0;            // 0 = NONE, 1 = FLOW, 2 = GEOM
++    // FLOW (LK flow + epipolar residual)
++    int   lkWin = 21;        // LK window [px]
++    int   lkLevels = 3;      // pyramid levels (maxLevel = lkLevels-1)
++    float lkErr = 20.f;      // max LK error (mean abs. patch difference)
++    float border = 10.f;     // border margin [px]
++    float ransacF = 1.0f;    // RANSAC inlier threshold for F [px]
++    float tauEpi = 1.0f;     // epipolar residual threshold [px]
++    float rf = 0.f;          // region radius [px]; 0 = point-wise
++    // GEOM (multi-view depth consistency)
++    int   Ko = 5;            // number of overlapping keyframes
++    float alphaMaxDeg = 30.f;// max parallax angle [deg]
++    float tauZ = 0.30f;      // depth threshold [m]
++    float tauG = 0.02f;      // region-growing depth step [m] (RGB-D)
++    int   growMax = 30;      // max growth distance from a seed [px] (RGB-D)
++    float rg = 15.f;         // flag radius around seeds [px] (stereo)
++    float stereoAssoc = 3.f; // radius of keypoints whose max depth is z' at x' [px] (stereo)
++    int   patchR = 2;        // half-size of the depth patch whose max depth is z' at x' [px] (RGB-D)
++};
++
+ class Tracking
+ {  
+ 
++public:
++    // ---------------- [study] dynamic-point filtering and evaluation logging ----------------
++    DynFilterConfig mDynCfg;
++    cv::Mat mGTMask;          // CV_8U, >0 = ground-truth dynamic (already dilated); evaluation only
++    cv::Mat mPrevGray;        // previous grayscale image (FLOW)
++    cv::Mat mCurDepth;        // current metric depth image, CV_32F (RGB-D only, GEOM)
++    FILE* mpLogFile = nullptr;
++    int mnResets = 0;
++    struct FrameStats { int N=0; int ran=0; int TP=0, FP=0, FN=0, TN=0; int nDepth=0; int nSeeds=0; } mStats;
++    void SetDynFilter(const DynFilterConfig &cfg){ mDynCfg = cfg; }
++    void SetGTMask(const cv::Mat &m){ mGTMask = m; }
++    void OpenLog(const std::string &path);
++    void CloseLog();
++protected:
++    std::vector<bool> FlowFilter();
++    std::vector<bool> GeomFilter();
++    void CountDecisions(const std::vector<bool> &vbDyn, bool ran);
++    void LogFrame();
++    void PreTrackFilter();
++    bool IsGTDynamic(const cv::KeyPoint &kp) const;
+ public:
+     Tracking(System* pSys, ORBVocabulary* pVoc, FrameDrawer* pFrameDrawer, MapDrawer* pMapDrawer, Map* pMap,
+              KeyFrameDatabase* pKFDB, const string &strSettingPath, const int sensor);
+--- a/Thirdparty/DBoW2/DBoW2/FORB.cpp
++++ b/Thirdparty/DBoW2/DBoW2/FORB.cpp
+@@ -13,7 +13,7 @@
+ #include <vector>
+ #include <string>
+ #include <sstream>
+-#include <stdint-gcc.h>
++#include <cstdint>
+ 
+ #include "FORB.h"
+ 
+--- a/Thirdparty/DBoW2/DBoW2/TemplatedVocabulary.h
++++ b/Thirdparty/DBoW2/DBoW2/TemplatedVocabulary.h
+@@ -239,6 +239,10 @@
+    * @param filename
+    */
+   bool loadFromTextFile(const std::string &filename);
++
++  /** Binary vocabulary I/O (added for this study: avoids re-parsing the 145 MB text file per run). */
++  bool loadFromBinaryFile(const std::string &filename);
++  void saveToBinaryFile(const std::string &filename) const;
+ 
+   /**
+    * Saves the vocabulary into a text file
+@@ -1424,6 +1428,65 @@
+ }
+ 
+ // --------------------------------------------------------------------------
++
++// --------------------------------------------------------------------------
++// Binary vocabulary I/O (added for this study). Reproduces exactly the node/word
++// structure produced by loadFromTextFile.
++template<class TDescriptor, class F>
++void TemplatedVocabulary<TDescriptor,F>::saveToBinaryFile(const std::string &filename) const
++{
++    std::ofstream f(filename.c_str(), std::ios::out | std::ios::binary);
++    int32_t hdr[5] = {m_k, m_L, (int32_t)m_scoring, (int32_t)m_weighting, (int32_t)m_nodes.size()};
++    f.write((const char*)hdr, sizeof(hdr));
++    for(size_t i=1; i<m_nodes.size(); i++)
++    {
++        const Node& node = m_nodes[i];
++        int32_t parent = (int32_t)node.parent;
++        uint8_t isWord = (node.word_id < m_words.size() && m_words[node.word_id] == &m_nodes[i]) ? 1 : 0;
++        double w = (double)node.weight;
++        f.write((const char*)&parent, sizeof(parent));
++        f.write((const char*)&isWord, sizeof(isWord));
++        cv::Mat d = node.descriptor;
++        if(d.empty()) d = cv::Mat::zeros(1, F::L, CV_8U);
++        f.write((const char*)d.ptr<uchar>(0), F::L);
++        f.write((const char*)&w, sizeof(w));
++    }
++}
++
++template<class TDescriptor, class F>
++bool TemplatedVocabulary<TDescriptor,F>::loadFromBinaryFile(const std::string &filename)
++{
++    std::ifstream f(filename.c_str(), std::ios::in | std::ios::binary);
++    if(!f.good()) return false;
++    int32_t hdr[5];
++    f.read((char*)hdr, sizeof(hdr));
++    m_k = hdr[0]; m_L = hdr[1]; m_scoring = (ScoringType)hdr[2]; m_weighting = (WeightingType)hdr[3];
++    createScoringObject();
++    m_words.clear(); m_nodes.clear();
++    m_nodes.resize(hdr[4]);
++    m_nodes[0].id = 0;
++    for(int nid=1; nid<hdr[4]; nid++)
++    {
++        int32_t parent; uint8_t isWord; double w;
++        f.read((char*)&parent, sizeof(parent));
++        f.read((char*)&isWord, sizeof(isWord));
++        m_nodes[nid].id = nid;
++        m_nodes[nid].parent = parent;
++        m_nodes[parent].children.push_back(nid);
++        m_nodes[nid].descriptor.create(1, F::L, CV_8U);
++        f.read((char*)m_nodes[nid].descriptor.ptr<uchar>(0), F::L);
++        f.read((char*)&w, sizeof(w));
++        m_nodes[nid].weight = w;
++        if(isWord)
++        {
++            int wid = m_words.size();
++            m_words.resize(wid+1);
++            m_nodes[nid].word_id = wid;
++            m_words[wid] = &m_nodes[nid];
++        }
++    }
++    return f.good();
++}
+ 
+ template<class TDescriptor, class F>
+ void TemplatedVocabulary<TDescriptor,F>::saveToTextFile(const std::string &filename) const
+--- a/Thirdparty/g2o/config.h
++++ b/Thirdparty/g2o/config.h
+@@ -0,0 +1,3 @@
++#ifndef G2O_CONFIG_H
++#define G2O_CONFIG_H
++#endif

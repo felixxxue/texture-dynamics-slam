@@ -1,0 +1,9 @@
+cff-version: 1.2.0
+message: "If you use this code or data, please cite the paper."
+title: "Does Dynamic-Point Filtering Help When Texture Is Scarce? A Controlled Study of ORB-SLAM2 Front-Ends in Synthetic Indoor Scenes"
+authors:
+  - family-names: Xue
+    given-names: Zekui
+    affiliation: "University of Bath"
+year: 2026
+license: GPL-3.0

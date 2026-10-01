@@ -1,0 +1,15 @@
+{
+ "scene": 1,
+ "tex": 1,
+ "dyn": 1,
+ "beta": 0.4,
+ "n_agents": 1,
+ "frames": 450,
+ "fps": 30.0,
+ "W": 640,
+ "H": 480,
+ "fx": 400.0,
+ "baseline": 0.1,
+ "noise_sigma": 1.0,
+ "render_s": 1241.9
+}
